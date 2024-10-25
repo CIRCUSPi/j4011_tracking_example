@@ -3,31 +3,78 @@ from ultralytics import YOLO
 import pafy
 import argparse
 import numpy as np
+from pyfirmata import Arduino, util
+import paho.mqtt.client as mqtt
+import time
+import threading
 
 # 初始化 YOLOv8 模型
 model = YOLO('yolov8s.pt')
 
+# 設定 Arduino 與初始化引腳
+board = Arduino('/dev/ttyACM0')  # 根據實際情況設置你的 Arduino 連接埠
+pin3 = board.get_pin('d:3:o')  # P3 作為輸出（高/低電位）
+pin4 = board.get_pin('d:4:o')  # P4 作為輸出（高/低電位）
+pin7 = board.get_pin('d:7:i')  # P7 作為輸入（按鈕）
+
+# 初始化引腳狀態
+pin3.write(0)  # 預設低電位
+pin4.write(0)  # 預設低電位
+
+# 初始化全域變數
+entering_count = 0
+leaving_count = 0
+object_track_history = {}
+my_conf = 0.25
+my_iou = 0.45
+
+# MQTT 設定
+broker = "broker.hivemq.com"
+port = 1883
+topic_entering = "ccvs/entering"
+topic_leaving = "ccvs/leaving"
+
+client = mqtt.Client()
+
+def on_connect(client, userdata, flags, rc):
+    print(f"Connected with result code {rc}")
+
+client.on_connect = on_connect
+client.connect(broker, port, 60)
+
+def publish_counts():
+    global entering_count, leaving_count
+    while True:
+        client.publish(topic_entering, entering_count)
+        client.publish(topic_leaving, leaving_count)
+        time.sleep(5)
+
+# 啟動 MQTT 發佈執行緒
+mqtt_thread = threading.Thread(target=publish_counts)
+mqtt_thread.daemon = True
+mqtt_thread.start()
+
 # 設定要追蹤的類別群組（人流 or 車流）
 def get_target_classes(flow_type):
-    if flow_type == 'person':
+    if (flow_type == 'person'):
         return ['person']
-    elif flow_type == 'vehicle':
+    elif (flow_type == 'vehicle'):
         return ['car', 'truck', 'motorcycle']
     else:
         raise ValueError("不支援的流量類型")
 
 # 輸入來源設定
 def get_input_source(source_type, source):
-    if source_type == 'file':
+    if (source_type == 'file'):
         return cv2.VideoCapture(source)
-    elif source_type == 'webcam':
-        return cv2.VideoCapture(0)  # 0 代表系統預設的 webcam
-    elif source_type == 'youtube':
+    elif (source_type == 'webcam'):
+        return cv2.VideoCapture(0)
+    elif (source_type == 'youtube'):
         video = pafy.new(source)
         best = video.getbest(preftype="mp4")
         return cv2.VideoCapture(best.url)
-    elif source_type == 'rtsp':
-        return cv2.VideoCapture(source)  # RTSP 串流連結
+    elif (source_type == 'rtsp'):
+        return cv2.VideoCapture(source)
     else:
         raise ValueError("不支援的輸入來源類型")
 
@@ -42,28 +89,19 @@ def calculate_line_params(x1, y1, x2, y2):
 def point_side(x, y, A, B, C):
     return A * x + B * y + C
 
-# 記錄進入和離開的計數
-entering_count = 0
-leaving_count = 0
-my_conf = 0.25
-my_iou = 0.45
-
-# 追蹤每個物件的過去位置
-object_track_history = {}
-
 # 主程序：讀取來源、追蹤並計算進出流量
 def main(flow_type, source_type, source, x1, y1, x2, y2):
     target_classes = get_target_classes(flow_type)
 
     # 開啟輸入來源
     cap = get_input_source(source_type, source)
-    
+
     if not cap.isOpened():
         print("Error: 無法開啟輸入來源")
         return
 
     global entering_count, leaving_count, object_track_history
-    
+
     # 計算直線的參數 A, B, C
     A, B, C = calculate_line_params(x1, y1, x2, y2)
 
@@ -117,6 +155,19 @@ def main(flow_type, source_type, source, x1, y1, x2, y2):
                     # 更新物件的最新位置
                     object_track_history[obj_id] = current_side
 
+        # 檢查統計數據是否超過 10 並控制 Arduino 引腳
+        if leaving_count > 10:
+            pin3.write(1)  # 設定 P3 高電位
+        if entering_count > 10:
+            pin4.write(1)  # 設定 P4 高電位
+
+        # 檢查按鈕狀態，若按下則清除統計
+        if pin7.read() == 0:
+            entering_count = 0
+            leaving_count = 0
+            pin3.write(0)  # 重設 P3 為低電位
+            pin4.write(0)  # 重設 P4 為低電位
+
         # 畫出邊界線
         cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
@@ -141,7 +192,7 @@ def main(flow_type, source_type, source, x1, y1, x2, y2):
 # 設定命令列參數解析
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="YOLOv8 物件追蹤與車/人流量計算")
-    
+
     # 流量類型參數 (人或車)
     parser.add_argument('--type', type=str, default='vehicle',
                         choices=['vehicle', 'person'],
@@ -151,7 +202,7 @@ if __name__ == '__main__':
     parser.add_argument('--input', type=str, default='file',
                         choices=['file', 'webcam', 'youtube', 'rtsp'],
                         help="選擇輸入來源類型: 'file', 'webcam', 'youtube', 'rtsp'")
-    
+
     # 輸入來源位置（檔案名、URL等）
     parser.add_argument('--source', type=str, default='demo.mp4',
                         help="輸入來源，若使用 'file'，則提供檔案名稱；若使用 'youtube'，則提供 YouTube 影片 URL")
@@ -166,5 +217,3 @@ if __name__ == '__main__':
 
     # 執行主程式
     main(args.type, args.input, args.source, args.x1, args.y1, args.x2, args.y2)
-
-
